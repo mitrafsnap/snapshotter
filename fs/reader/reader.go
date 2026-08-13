@@ -34,8 +34,10 @@ import (
 	"runtime"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/containerd/log"
 	"github.com/containerd/stargz-snapshotter/cache"
 	"github.com/containerd/stargz-snapshotter/estargz"
 	commonmetrics "github.com/containerd/stargz-snapshotter/fs/metrics/common"
@@ -55,7 +57,7 @@ type Reader interface {
 }
 
 type PassthroughFdGetter interface {
-	GetPassthroughFd(mergeBufferSize int64, mergeWorkerCount int) (uintptr, cache.Reader, error)
+	GetPassthroughFd(ctx context.Context, mergeBufferSize int64, mergeWorkerCount int) (uintptr, cache.Reader, error)
 }
 
 // VerifiableReader produces a Reader with a given verifier.
@@ -139,17 +141,18 @@ func (vr *VerifiableReader) Cache(opts ...CacheOption) (err error) {
 	if cacheOpts.filter != nil {
 		filter = cacheOpts.filter
 	}
+	chunkFilter := cacheOpts.chunkFilter
 
 	eg, egCtx := errgroup.WithContext(context.Background())
 	eg.Go(func() error {
 		return vr.cacheWithReader(egCtx,
 			0, eg, semaphore.NewWeighted(int64(runtime.GOMAXPROCS(0))),
-			rootID, r, filter, cacheOpts.cacheOpts...)
+			rootID, r, filter, chunkFilter, cacheOpts.cacheOpts...)
 	})
 	return eg.Wait()
 }
 
-func (vr *VerifiableReader) cacheWithReader(ctx context.Context, currentDepth int, eg *errgroup.Group, sem *semaphore.Weighted, dirID uint32, r metadata.Reader, filter func(int64) bool, opts ...cache.Option) (rErr error) {
+func (vr *VerifiableReader) cacheWithReader(ctx context.Context, currentDepth int, eg *errgroup.Group, sem *semaphore.Weighted, dirID uint32, r metadata.Reader, filter func(int64) bool, chunkFilter func(uint32, int64) bool, opts ...cache.Option) (rErr error) {
 	if currentDepth > maxWalkDepth {
 		return fmt.Errorf("tree is too deep (depth:%d)", currentDepth)
 	}
@@ -169,7 +172,7 @@ func (vr *VerifiableReader) cacheWithReader(ctx context.Context, currentDepth in
 				return true
 			}
 
-			if err := vr.cacheWithReader(ctx, currentDepth+1, eg, sem, id, r, filter, opts...); err != nil {
+			if err := vr.cacheWithReader(ctx, currentDepth+1, eg, sem, id, r, filter, chunkFilter, opts...); err != nil {
 				rErr = err
 				return false
 			}
@@ -208,6 +211,10 @@ func (vr *VerifiableReader) cacheWithReader(ctx context.Context, currentDepth in
 			}
 			nr += chunkSize
 
+			if chunkFilter != nil && !chunkFilter(id, chunkOffset) {
+				continue
+			}
+
 			if err := sem.Acquire(ctx, 1); err != nil {
 				rErr = err
 				return false
@@ -237,7 +244,7 @@ func (vr *VerifiableReader) readAndCache(id uint32, fr io.Reader, chunkOffset, c
 	}
 
 	// Check if it already exists in the cache
-	cacheID := genID(id, chunkOffset, chunkSize)
+	cacheID := GenID(id, chunkOffset, chunkSize)
 	if r, err := gr.cache.Get(cacheID); err == nil {
 		r.Close()
 		return nil
@@ -362,7 +369,7 @@ func (gr *reader) OpenFile(id uint32) (io.ReaderAt, error) {
 	var fr metadata.File
 	fr, err := gr.r.OpenFileWithPreReader(id, func(nid uint32, chunkOffset, chunkSize int64, chunkDigest string, r io.Reader) error {
 		// Check if it already exists in the cache
-		cacheID := genID(nid, chunkOffset, chunkSize)
+		cacheID := GenID(nid, chunkOffset, chunkSize)
 		if r, err := gr.cache.Get(cacheID); err == nil {
 			r.Close()
 			return nil
@@ -436,7 +443,7 @@ func (sf *file) ReadAt(p []byte, offset int64) (int, error) {
 			break
 		}
 		var (
-			id           = genID(sf.id, chunkOffset, chunkSize)
+			id           = GenID(sf.id, chunkOffset, chunkSize)
 			lowerDiscard = positive(offset - chunkOffset)
 			upperDiscard = positive(chunkOffset + chunkSize - (offset + int64(len(p))))
 			expectedSize = chunkSize - upperDiscard - lowerDiscard
@@ -503,7 +510,8 @@ type chunkData struct {
 	bufferPos int64
 }
 
-func (sf *file) GetPassthroughFd(mergeBufferSize int64, mergeWorkerCount int) (uintptr, cache.Reader, error) {
+func (sf *file) GetPassthroughFd(ctx context.Context, mergeBufferSize int64, mergeWorkerCount int) (uintptr, cache.Reader, error) {
+	openStart := time.Now()
 	var (
 		offset        int64
 		totalSize     int64
@@ -529,19 +537,19 @@ func (sf *file) GetPassthroughFd(mergeBufferSize int64, mergeWorkerCount int) (u
 		offset = chunkOffset + chunkSize
 	}
 
-	id := genID(sf.id, 0, totalSize)
+	id := GenID(sf.id, 0, totalSize)
 
+	var bytesFromRegistry int64
 	// cache.PassThrough() is necessary to take over files
 	r, err := sf.gr.cache.Get(id, cache.PassThrough())
 	if err != nil {
 		if hasLargeChunk {
-			if err := sf.prefetchEntireFileSequential(id); err != nil {
-				return 0, nil, err
-			}
+			bytesFromRegistry, err = sf.prefetchEntireFileSequential(id)
 		} else {
-			if err := sf.prefetchEntireFile(id, chunks, totalSize, mergeBufferSize, mergeWorkerCount); err != nil {
-				return 0, nil, err
-			}
+			bytesFromRegistry, err = sf.prefetchEntireFile(id, chunks, totalSize, mergeBufferSize, mergeWorkerCount)
+		}
+		if err != nil {
+			return 0, nil, err
 		}
 
 		// just retry once to avoid exception stuck
@@ -558,16 +566,27 @@ func (sf *file) GetPassthroughFd(mergeBufferSize int64, mergeWorkerCount int) (u
 		return 0, nil, fmt.Errorf("the cached ReaderAt is not of type *os.File, fd obtain failed")
 	}
 
-	fd := file.Fd()
-	return fd, r, nil
+	log.G(ctx).WithFields(log.Fields{
+		"metrics":             "file_access",
+		"operation":           commonmetrics.PassthroughOpen,
+		"layer_sha":           sf.gr.layerSha.String(),
+		"file_id":             sf.id,
+		"on_demand":           bytesFromRegistry > 0,
+		"duration_ms":         float64(time.Since(openStart).Nanoseconds()) / 1e6,
+		"total_bytes":         totalSize,
+		"bytes_from_registry": bytesFromRegistry,
+	}).Debug("passthrough file access")
+
+	return file.Fd(), r, nil
 }
 
 // prefetchEntireFileSequential uses the legacy sequential approach for processing chunks
 // when chunk size exceeds merge buffer size to avoid slice bounds out of range panic
-func (sf *file) prefetchEntireFileSequential(entireCacheID string) error {
+func (sf *file) prefetchEntireFileSequential(entireCacheID string) (int64, error) {
+	var bytesFromRegistry int64
 	w, err := sf.gr.cache.Add(entireCacheID)
 	if err != nil {
-		return fmt.Errorf("failed to create cache writer: %w", err)
+		return 0, fmt.Errorf("failed to create cache writer: %w", err)
 	}
 	defer w.Close()
 
@@ -579,7 +598,7 @@ func (sf *file) prefetchEntireFileSequential(entireCacheID string) error {
 			break
 		}
 
-		id := genID(sf.id, chunkOffset, chunkSize)
+		id := GenID(sf.id, chunkOffset, chunkSize)
 		b := sf.gr.bufPool.Get().(*bytes.Buffer)
 		b.Reset()
 		b.Grow(int(chunkSize))
@@ -592,7 +611,7 @@ func (sf *file) prefetchEntireFileSequential(entireCacheID string) error {
 					r.Close()
 					sf.gr.putBuffer(b)
 					w.Abort()
-					return fmt.Errorf("failed to write cached data: %w", err)
+					return bytesFromRegistry, fmt.Errorf("failed to write cached data: %w", err)
 				}
 				offset = chunkOffset + int64(n)
 				r.Close()
@@ -605,38 +624,41 @@ func (sf *file) prefetchEntireFileSequential(entireCacheID string) error {
 		if _, err := sf.fr.ReadAt(ip, chunkOffset); err != nil && err != io.EOF {
 			sf.gr.putBuffer(b)
 			w.Abort()
-			return fmt.Errorf("failed to read data: %w", err)
+			return bytesFromRegistry, fmt.Errorf("failed to read data: %w", err)
 		}
+		bytesFromRegistry += chunkSize
 		if err := sf.gr.verifyOneChunk(sf.id, ip, chunkDigestStr); err != nil {
 			sf.gr.putBuffer(b)
 			w.Abort()
-			return err
+			return bytesFromRegistry, err
 		}
 		if _, err := w.Write(ip); err != nil {
 			sf.gr.putBuffer(b)
 			w.Abort()
-			return fmt.Errorf("failed to write fetched data: %w", err)
+			return bytesFromRegistry, fmt.Errorf("failed to write fetched data: %w", err)
 		}
 		offset = chunkOffset + chunkSize
 		sf.gr.putBuffer(b)
 	}
 
-	return w.Commit()
+	return bytesFromRegistry, w.Commit()
 }
 
 type batchWorkerArgs struct {
-	workerID    int
-	chunks      []chunkData
-	buffer      []byte
-	workerCount int
-	readInfos   []chunkReadInfo
+	workerID          int
+	chunks            []chunkData
+	buffer            []byte
+	workerCount       int
+	readInfos         []chunkReadInfo
+	bytesFromRegistry *atomic.Int64
 }
 
-func (sf *file) prefetchEntireFile(entireCacheID string, chunks []chunkData, totalSize int64, bufferSize int64, workerCount int) error {
+func (sf *file) prefetchEntireFile(entireCacheID string, chunks []chunkData, totalSize int64, bufferSize int64, workerCount int) (int64, error) {
+	var bytesFromRegistry atomic.Int64
 
 	w, err := sf.gr.cache.Add(entireCacheID)
 	if err != nil {
-		return fmt.Errorf("failed to create cache writer: %w", err)
+		return 0, fmt.Errorf("failed to create cache writer: %w", err)
 	}
 	defer w.Close()
 
@@ -673,10 +695,11 @@ func (sf *file) prefetchEntireFile(entireCacheID string, chunks []chunkData, tot
 		for i := 0; i < workerCount && i < len(batchChunks); i++ {
 			workerID := i
 			args := &batchWorkerArgs{
-				workerID:    workerID,
-				chunks:      batchChunks,
-				buffer:      buffer,
-				workerCount: workerCount,
+				workerID:          workerID,
+				chunks:            batchChunks,
+				buffer:            buffer,
+				workerCount:       workerCount,
+				bytesFromRegistry: &bytesFromRegistry,
 			}
 			eg.Go(func() error {
 				err := sf.processBatchChunks(args)
@@ -689,7 +712,7 @@ func (sf *file) prefetchEntireFile(entireCacheID string, chunks []chunkData, tot
 
 		if err := eg.Wait(); err != nil {
 			w.Abort()
-			return err
+			return bytesFromRegistry.Load(), err
 		}
 
 		var mergedReadInfos []chunkReadInfo
@@ -699,22 +722,22 @@ func (sf *file) prefetchEntireFile(entireCacheID string, chunks []chunkData, tot
 
 		if err := sf.checkHoles(mergedReadInfos, batchSize); err != nil {
 			w.Abort()
-			return fmt.Errorf("hole check failed: %w", err)
+			return bytesFromRegistry.Load(), fmt.Errorf("hole check failed: %w", err)
 		}
 
 		n, err := w.Write(buffer)
 		if err != nil {
 			w.Abort()
-			return fmt.Errorf("failed to write batch data: %w", err)
+			return bytesFromRegistry.Load(), fmt.Errorf("failed to write batch data: %w", err)
 		}
 
 		if int64(n) != batchSize {
 			w.Abort()
-			return fmt.Errorf("incomplete write: expected %d bytes, wrote %d bytes", batchSize, n)
+			return bytesFromRegistry.Load(), fmt.Errorf("incomplete write: expected %d bytes, wrote %d bytes", batchSize, n)
 		}
 	}
 
-	return w.Commit()
+	return bytesFromRegistry.Load(), w.Commit()
 }
 
 type chunkReadInfo struct {
@@ -755,7 +778,7 @@ func (sf *file) processBatchChunks(args *batchWorkerArgs) error {
 		chunk := args.chunks[chunkIdx]
 		bufStart := args.buffer[chunk.bufferPos : chunk.bufferPos+chunk.size]
 
-		id := genID(sf.id, chunk.offset, chunk.size)
+		id := GenID(sf.id, chunk.offset, chunk.size)
 		if r, err := sf.gr.cache.Get(id); err == nil {
 			n, err := r.ReadAt(bufStart, 0)
 			r.Close()
@@ -773,6 +796,9 @@ func (sf *file) processBatchChunks(args *batchWorkerArgs) error {
 		n, err := sf.fr.ReadAt(bufStart, chunk.offset)
 		if err != nil && err != io.EOF {
 			return fmt.Errorf("failed to read data at offset %d: %w", chunk.offset, err)
+		}
+		if args.bytesFromRegistry != nil {
+			args.bytesFromRegistry.Add(int64(n))
 		}
 
 		readInfos = append(readInfos, chunkReadInfo{
@@ -837,7 +863,7 @@ func (gr *reader) verifyChunk(id uint32, p []byte, chunkDigestStr string) error 
 	return nil
 }
 
-func genID(id uint32, offset, size int64) string {
+func GenID(id uint32, offset, size int64) string {
 	sum := sha256.Sum256(fmt.Appendf(nil, "%d-%d-%d", id, offset, size))
 	return fmt.Sprintf("%x", sum)
 }
@@ -852,9 +878,10 @@ func positive(n int64) int64 {
 type CacheOption func(*cacheOptions)
 
 type cacheOptions struct {
-	cacheOpts []cache.Option
-	filter    func(int64) bool
-	reader    *io.SectionReader
+	cacheOpts   []cache.Option
+	filter      func(int64) bool
+	chunkFilter func(id uint32, chunkOffset int64) bool
+	reader      *io.SectionReader
 }
 
 func WithCacheOpts(cacheOpts ...cache.Option) CacheOption {
@@ -866,6 +893,16 @@ func WithCacheOpts(cacheOpts ...cache.Option) CacheOption {
 func WithFilter(filter func(int64) bool) CacheOption {
 	return func(opts *cacheOptions) {
 		opts.filter = filter
+	}
+}
+
+// WithChunkFilter scopes Cache to the chunks for which the filter returns true.
+// The filter receives the metadata file id and the logical chunk offset within
+// that file. It is evaluated per-chunk after the file-level WithFilter, so the
+// two can be combined.
+func WithChunkFilter(filter func(id uint32, chunkOffset int64) bool) CacheOption {
+	return func(opts *cacheOptions) {
+		opts.chunkFilter = filter
 	}
 }
 

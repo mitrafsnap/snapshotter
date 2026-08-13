@@ -51,6 +51,7 @@ import (
 	"github.com/containerd/stargz-snapshotter/fs/layer"
 	commonmetrics "github.com/containerd/stargz-snapshotter/fs/metrics/common"
 	layermetrics "github.com/containerd/stargz-snapshotter/fs/metrics/layer"
+	pb "github.com/containerd/stargz-snapshotter/fs/pb"
 	"github.com/containerd/stargz-snapshotter/fs/remote"
 	"github.com/containerd/stargz-snapshotter/fs/source"
 	"github.com/containerd/stargz-snapshotter/metadata"
@@ -194,6 +195,7 @@ func NewFilesystem(root string, cfg config.Config, opts ...Option) (_ snapshot.F
 		metricsController:     metricsCtr,
 		attrTimeout:           attrTimeout,
 		entryTimeout:          entryTimeout,
+		subs:                  make(map[string]*subscription),
 	}, nil
 }
 
@@ -212,6 +214,8 @@ type filesystem struct {
 	metricsController     *layermetrics.Controller
 	attrTimeout           time.Duration
 	entryTimeout          time.Duration
+	subsMu                sync.Mutex
+	subs                  map[string]*subscription
 }
 
 func (fs *filesystem) Mount(ctx context.Context, mountpoint string, labels map[string]string) (retErr error) {
@@ -233,9 +237,11 @@ func (fs *filesystem) Mount(ctx context.Context, mountpoint string, labels map[s
 		return fmt.Errorf("source must be passed")
 	}
 
-	defaultPrefetchSize := fs.prefetchSize
+	defaultPrefetchSize := fs.prefetchSize // 0 by default
+	log.G(ctx).Logf(log.DebugLevel, "default prefetch size: %d\n", fs.prefetchSize)
 	if psStr, ok := labels[config.TargetPrefetchSizeLabel]; ok {
 		if ps, err := strconv.ParseInt(psStr, 10, 64); err == nil {
+			log.G(ctx).Logf(log.DebugLevel, "changing prefetch size to: %d\n", ps)
 			defaultPrefetchSize = ps
 		}
 	}
@@ -251,6 +257,8 @@ func (fs *filesystem) Mount(ctx context.Context, mountpoint string, labels map[s
 			l, err := fs.resolver.Resolve(ctx, s.Hosts, s.Name, s.Target)
 			if err == nil {
 				resultChan <- l
+				// waits for layer to be resolved
+				log.G(ctx).Logf(log.DebugLevel, "[Mount1] calling prefetch for layer %s with prefetchSize %d", l.Info().Digest.String(), defaultPrefetchSize)
 				fs.prefetch(ctx, l, defaultPrefetchSize, start)
 				return
 			}
@@ -262,6 +270,14 @@ func (fs *filesystem) Mount(ctx context.Context, mountpoint string, labels map[s
 	// Also resolve and cache other layers in parallel
 	preResolve := src[0] // TODO: should we pre-resolve blobs in other sources as well?
 	for _, desc := range neighboringLayers(preResolve.Manifest, preResolve.Target) {
+		desc := desc
+		layerPrefetchSize := fs.prefetchSize
+		if psStr, ok := desc.Annotations[config.TargetPrefetchSizeLabel]; ok {
+			if ps, err := strconv.ParseInt(psStr, 10, 64); err == nil {
+				log.G(ctx).Logf(log.DebugLevel, "changing neighbor prefetch size to: %d\n for layer %s", ps, desc.Digest.String())
+				layerPrefetchSize = ps
+			}
+		}
 		go func() {
 			// Avoids to get canceled by client.
 			ctx := log.WithLogger(context.Background(), log.G(ctx).WithField("mountpoint", mountpoint))
@@ -270,7 +286,9 @@ func (fs *filesystem) Mount(ctx context.Context, mountpoint string, labels map[s
 				log.G(ctx).WithError(err).Debug("failed to pre-resolve")
 				return
 			}
-			fs.prefetch(ctx, l, defaultPrefetchSize, start)
+			// called right away
+			log.G(ctx).Logf(log.DebugLevel, "[Mount2] calling prefetch for layer %s with prefetchSize %d", l.Info().Digest.String(), layerPrefetchSize)
+			fs.prefetch(ctx, l, layerPrefetchSize, start)
 
 			// Release this layer because this isn't target and we don't use it anymore here.
 			// However, this will remain on the resolver cache until eviction.
@@ -391,8 +409,12 @@ func (fs *filesystem) Check(ctx context.Context, mountpoint string, labels map[s
 
 	// Wait for prefetch compeletion
 	if !fs.noprefetch {
+		log.G(ctx).Debug("waiting for prefetch completion")
+		prefetchWaitStart := time.Now()
 		if err := l.WaitForPrefetchCompletion(); err != nil {
 			log.G(ctx).WithError(err).Warn("failed to sync with prefetch completion")
+		} else {
+			log.G(ctx).WithField("elapsed", time.Since(prefetchWaitStart)).Debug("prefetch completion done")
 		}
 	}
 
@@ -431,6 +453,102 @@ func (fs *filesystem) check(ctx context.Context, l layer.Layer, labels map[strin
 	return rErr
 }
 
+func (fs *filesystem) findLayerByDigest(d digest.Digest) layer.Layer {
+	fs.layerMu.Lock()
+	defer fs.layerMu.Unlock()
+	for _, l := range fs.layer {
+		if l.Info().Digest == d {
+			return l
+		}
+	}
+	return nil
+}
+
+// RefreshImage refreshes a batch of layers identified by (old, new) digest pairs.
+// Pairs whose old and new digests are equal are skipped. Per-pair failures are recorded in
+// the corresponding LayerResult and do not abort the rest of the batch.
+func (fs *filesystem) RefreshImage(ctx context.Context, pairs []pb.ImageLayerPair, withBackgroundFetch bool) ([]*pb.LayerResult, error) {
+	fs.backgroundTaskManager.DoPrioritizedTask()
+	defer fs.backgroundTaskManager.DonePrioritizedTask()
+
+	results := make([]*pb.LayerResult, 0, len(pairs))
+	for _, p := range pairs {
+		res := &pb.LayerResult{
+			OldDigest: p.OldDigest.String(),
+			NewDigest: p.NewDigest.String(),
+		}
+		if p.OldDigest == p.NewDigest {
+			results = append(results, res)
+			continue
+		}
+
+		pairCtx := log.WithLogger(ctx, log.G(ctx).WithFields(log.Fields{
+			"old_digest": p.OldDigest,
+			"new_digest": p.NewDigest,
+		}))
+		targetLayer := fs.findLayerByDigest(p.OldDigest)
+		if targetLayer == nil {
+			res.Error = fmt.Sprintf("layer with digest %s not found among mounted layers", p.OldDigest)
+			log.G(pairCtx).Warn(res.Error)
+			results = append(results, res)
+			continue
+		}
+
+		newDesc := ocispec.Descriptor{Digest: p.NewDigest}
+		delta, err := targetLayer.RefreshBlob(pairCtx, newDesc, p.NewTOCDigest)
+		if err != nil {
+			res.Error = fmt.Sprintf("failed to refresh layer blob: %v", err)
+			log.G(pairCtx).WithError(err).Warn("failed to refresh layer blob")
+			results = append(results, res)
+			continue
+		}
+		fields := log.Fields{}
+		if delta != nil {
+			res.Fallback = delta.Fallback
+			res.ChangedChunks = int64(len(delta.ChangedChunks))
+			res.AddedChunks = int64(len(delta.AddedChunks))
+			fields["changed_chunks"] = res.ChangedChunks
+			fields["added_chunks"] = res.AddedChunks
+			fields["fallback"] = delta.Fallback
+		}
+		log.G(pairCtx).WithFields(fields).Info("layer blob refreshed successfully")
+
+		if withBackgroundFetch {
+			go runBackgroundFetchAfterRefresh(pairCtx, targetLayer, delta)
+		}
+		results = append(results, res)
+	}
+	return results, nil
+}
+
+// runBackgroundFetchAfterRefresh fetches new chunks in the background, scoped to
+// the delta when available and falling back to a full layer fetch otherwise.
+func runBackgroundFetchAfterRefresh(ctx context.Context, l layer.Layer, delta *layer.DeltaResult) {
+	if delta == nil || delta.Fallback {
+		if err := l.BackgroundFetch(); err != nil {
+			log.G(ctx).WithError(err).Warn("background fetch after refresh failed")
+			return
+		}
+		log.G(ctx).Info("background fetch after refresh completed (whole layer)")
+		return
+	}
+	chunks := make([]layer.ChunkRef, 0, len(delta.ChangedChunks)+len(delta.AddedChunks))
+	chunks = append(chunks, delta.ChangedChunks...)
+	chunks = append(chunks, delta.AddedChunks...)
+	if len(chunks) == 0 {
+		log.G(ctx).Info("background fetch after refresh skipped: no chunks changed")
+		return
+	}
+	if err := l.BackgroundFetchChunks(ctx, chunks); err != nil {
+		log.G(ctx).WithError(err).Warn("scoped background fetch after refresh failed")
+		return
+	}
+	log.G(ctx).WithFields(log.Fields{
+		"changed_chunks": len(delta.ChangedChunks),
+		"added_chunks":   len(delta.AddedChunks),
+	}).Info("background fetch after refresh completed (scoped)")
+}
+
 func (fs *filesystem) Unmount(ctx context.Context, mountpoint string) error {
 	if mountpoint == "" {
 		return fmt.Errorf("mount point must be specified")
@@ -441,12 +559,14 @@ func (fs *filesystem) Unmount(ctx context.Context, mountpoint string) error {
 		fs.layerMu.Unlock()
 		return fmt.Errorf("specified path %q isn't a mountpoint", mountpoint)
 	}
-	delete(fs.layer, mountpoint)      // unregisters the corresponding layer
+	delete(fs.layer, mountpoint) // unregisters the corresponding layer
+	layerDigest := l.Info().Digest
 	if err := l.Close(); err != nil { // Cleanup associated resources
 		log.G(ctx).WithError(err).Warn("failed to release resources of the layer")
 	}
 	fs.layerMu.Unlock()
 	fs.metricsController.Remove(mountpoint)
+	fs.dropSubscriptionsForLayer(layerDigest)
 
 	if err := unmount(mountpoint, 0); err != nil {
 		if err != unix.EBUSY {

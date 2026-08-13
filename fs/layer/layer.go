@@ -85,6 +85,20 @@ type Layer interface {
 	// Refresh refreshes the layer connection.
 	Refresh(ctx context.Context, hosts source.RegistryHosts, refspec reference.Spec, desc ocispec.Descriptor) error
 
+	// RefreshBlob switches the layer to use a new blob with a different digest.
+	// It fetches the new blob's TOC to update file offsets and invalidates caches.
+	// Verification is skipped. The operation is atomic with respect to FUSE reads.
+	//
+	// The returned DeltaResult describes the chunks that differ between the old
+	// and new TOCs. DeltaResult.Fallback is true when the old and new TOCs
+	// cannot be aligned chunk-for-chunk, in which case the layer fell back to
+	// whole-blob invalidation.
+	RefreshBlob(ctx context.Context, newDesc ocispec.Descriptor, expectedTOC digest.Digest) (*DeltaResult, error)
+
+	// BackgroundFetchChunks fetches only the named chunks from the current blob
+	// into the cache.
+	BackgroundFetchChunks(ctx context.Context, chunks []ChunkRef) error
+
 	// Verify verifies this layer using the passed TOC Digest.
 	// Nop if Verify() or SkipVerify() was already called.
 	Verify(tocDigest digest.Digest) (err error)
@@ -332,7 +346,7 @@ func (r *Resolver) Resolve(ctx context.Context, hosts source.RegistryHosts, refs
 	}
 
 	// Combine layer information together and cache it.
-	l := newLayer(r, desc, blobR, vr, passThroughConfig{
+	l := newLayer(r, desc, blobR, vr, fsCache, hosts, refspec, passThroughConfig{
 		enable:           r.config.PassThrough,
 		mergeBufferSize:  r.config.MergeBufferSize,
 		mergeWorkerCount: r.config.MergeWorkerCount,
@@ -391,11 +405,38 @@ func (r *Resolver) resolveBlob(ctx context.Context, hosts source.RegistryHosts, 
 	return &blobRef{cachedB.(remote.Blob), done}, nil
 }
 
+// readerRef wraps a reader.Reader behind a RWMutex, enabling atomic reader
+// swaps while FUSE nodes continue to serve reads. Both the layer and FUSE fs
+// struct share the same readerRef so a swap is visible to all FUSE operations.
+type readerRef struct {
+	mu sync.RWMutex
+	r  reader.Reader
+}
+
+// get returns the current reader under a read lock.
+func (rr *readerRef) get() reader.Reader {
+	rr.mu.RLock()
+	defer rr.mu.RUnlock()
+	return rr.r
+}
+
+// swap atomically replaces the reader and returns the old one.
+func (rr *readerRef) swap(newR reader.Reader) reader.Reader {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	old := rr.r
+	rr.r = newR
+	return old
+}
+
 func newLayer(
 	resolver *Resolver,
 	desc ocispec.Descriptor,
 	blob *blobRef,
 	vr *reader.VerifiableReader,
+	fsCache cache.BlobCache,
+	hosts source.RegistryHosts,
+	refspec reference.Spec,
 	pth passThroughConfig,
 	logFileAccess bool,
 ) *layer {
@@ -404,6 +445,10 @@ func newLayer(
 		desc:             desc,
 		blob:             blob,
 		verifiableReader: vr,
+		fsCache:          fsCache,
+		hosts:            hosts,
+		refspec:          refspec,
+		rr:               &readerRef{},
 		prefetchWaiter:   newWaiter(),
 		passThrough:      pth,
 		logFileAccess:    logFileAccess,
@@ -415,6 +460,11 @@ type layer struct {
 	desc             ocispec.Descriptor
 	blob             *blobRef
 	verifiableReader *reader.VerifiableReader
+	fsCache          cache.BlobCache
+	hosts            source.RegistryHosts
+	refspec          reference.Spec
+	rr               *readerRef // shared with FUSE nodes for atomic swap
+	rootInode        *fusefs.Inode
 	prefetchWaiter   *waiter
 
 	prefetchSize   int64
@@ -467,6 +517,155 @@ func (l *layer) Refresh(ctx context.Context, hosts source.RegistryHosts, refspec
 	return l.blob.Refresh(ctx, hosts, refspec, desc)
 }
 
+func (l *layer) RefreshBlob(ctx context.Context, newDesc ocispec.Descriptor, expectedTOC digest.Digest) (*DeltaResult, error) {
+	if l.isClosed() {
+		return nil, fmt.Errorf("layer is already closed")
+	}
+
+	// Resolve the new blob from the same registry.
+	newBlobR, err := l.resolver.resolveBlob(ctx, l.hosts, l.refspec, newDesc)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve new blob: %w", err)
+	}
+
+	// Create a SectionReader over the new blob.
+	sr := io.NewSectionReader(readerAtFunc(func(p []byte, offset int64) (n int, err error) {
+		l.resolver.backgroundTaskManager.DoPrioritizedTask()
+		defer l.resolver.backgroundTaskManager.DonePrioritizedTask()
+		return newBlobR.ReadAt(p, offset)
+	}), 0, newBlobR.Size())
+
+	// Read metadata (footer + TOC) from the new blob.
+	// Include zstdchunked decompressor so both gzip and zstd-chunked blobs are handled.
+	additionalDecompressors := []metadata.Decompressor{new(zstdchunked.Decompressor)}
+	if l.resolver.additionalDecompressors != nil {
+		additionalDecompressors = append(additionalDecompressors, l.resolver.additionalDecompressors(ctx, l.hosts, l.refspec, newDesc)...)
+	}
+	meta, err := l.resolver.metadataStore(sr, metadata.WithDecompressors(additionalDecompressors...))
+	if err != nil {
+		newBlobR.done(true)
+		return nil, fmt.Errorf("failed to read metadata from new blob: %w", err)
+	}
+
+	// Diff the old and new TOCs while the old reader is still active.
+	delta, diffErr := diffTOCs(l.verifiableReader.Metadata(), meta)
+	if diffErr != nil {
+		log.G(ctx).WithError(diffErr).Warn("delta refresh diff failed; falling back to whole-layer invalidation")
+		delta = &DeltaResult{Fallback: true, FallbackReason: "diff error: " + diffErr.Error()}
+	}
+
+	vr, err := reader.NewReader(meta, l.fsCache, newDesc.Digest)
+	if err != nil {
+		newBlobR.done(true)
+		return nil, fmt.Errorf("failed to create reader: %w", err)
+	}
+	newReader, verifyErr := refreshVerify(vr, expectedTOC, l.resolver.config.DisableVerification, l.resolver.config.AllowNoVerification)
+	if verifyErr != nil {
+		newBlobR.done(true)
+		return nil, verifyErr
+	}
+
+	oldDigest := l.desc.Digest
+
+	// Atomically swap the reader visible to FUSE nodes.
+	l.rr.swap(newReader)
+
+	// Update layer state.
+	l.blob = newBlobR
+	l.desc = newDesc
+	l.verifiableReader = vr
+	l.r = newReader
+
+	// Reset so callers can re-trigger them against the new blob
+	l.prefetchOnce = sync.Once{}
+	l.backgroundFetchOnce = sync.Once{}
+
+	if l.rootInode != nil {
+		idx := buildInodeIndex(l.rootInode)
+		if delta.Fallback {
+			log.G(ctx).WithField("reason", delta.FallbackReason).Info("delta refresh fell back to whole-layer invalidation")
+			invalidateInodeCache(l.rootInode)
+			refreshAttrs(ctx, idx, idxKeys(idx), newReader.Metadata())
+		} else {
+			invalidateChangedChunks(l.rootInode, delta.ChangedChunks)
+			refreshAttrs(ctx, idx, delta.ChangedFiles, newReader.Metadata())
+		}
+	}
+
+	for _, key := range delta.StaleCacheKeys {
+		if err := l.fsCache.Remove(key); err != nil {
+			log.G(ctx).WithError(err).WithField("key", key).Warn("evict stale fscache entry")
+		}
+	}
+
+	log.G(ctx).WithFields(log.Fields{
+		"changed_chunks": len(delta.ChangedChunks),
+		"added_chunks":   len(delta.AddedChunks),
+		"fallback":       delta.Fallback,
+	}).Infof("refreshed layer blob from %s to %s", oldDigest, newDesc.Digest)
+	return delta, nil
+}
+
+func refreshVerify(vr *reader.VerifiableReader, expectedTOC digest.Digest, disableVerification, allowNoVerification bool) (reader.Reader, error) {
+	switch {
+	case disableVerification:
+		return vr.SkipVerify(), nil
+	case expectedTOC != "":
+		newReader, err := vr.VerifyTOC(expectedTOC)
+		if err != nil {
+			return nil, fmt.Errorf("verify new TOC %s: %w", expectedTOC, err)
+		}
+		return newReader, nil
+	case allowNoVerification:
+		return vr.SkipVerify(), nil
+	default:
+		return nil, fmt.Errorf("refresh refused: new TOC digest is required (set new_toc_digest, or enable allow_no_verification / disable_verification)")
+	}
+}
+
+// invalidateInodeCache recursively walks the FUSE inode tree and
+// invalidates kernel page cache for each inode.
+func invalidateInodeCache(inode *fusefs.Inode) {
+	// Invalidate this inode's cached pages (off=0, sz=0 means all).
+	inode.NotifyContent(0, 0)
+	for _, child := range inode.Children() {
+		invalidateInodeCache(child)
+	}
+}
+
+// refreshAttrs reloads node attrs from the new metadata reader for the given
+// file ids and invalidates the kernel's attr cache so the next stat call is
+// forwarded back to FUSE filesystem instead of being served from cache.
+func refreshAttrs(ctx context.Context, idx map[uint32]*fusefs.Inode, ids []uint32, meta metadata.Reader) {
+	for _, id := range ids {
+		in, ok := idx[id]
+		if !ok {
+			continue
+		}
+		n, ok := in.Operations().(*node)
+		if !ok {
+			continue
+		}
+		a, err := meta.GetAttr(id)
+		if err != nil {
+			log.G(ctx).WithError(err).WithField("id", id).Warn("refresh attr: GetAttr")
+			continue
+		}
+		n.attr.Store(&a)
+		if name, parent := in.Parent(); parent != nil {
+			parent.NotifyEntry(name)
+		}
+	}
+}
+
+func idxKeys(idx map[uint32]*fusefs.Inode) []uint32 {
+	out := make([]uint32, 0, len(idx))
+	for id := range idx {
+		out = append(out, id)
+	}
+	return out
+}
+
 func (l *layer) Verify(tocDigest digest.Digest) (err error) {
 	if l.isClosed() {
 		return fmt.Errorf("layer is already closed")
@@ -475,6 +674,9 @@ func (l *layer) Verify(tocDigest digest.Digest) (err error) {
 		return nil
 	}
 	l.r, err = l.verifiableReader.VerifyTOC(tocDigest)
+	if err == nil {
+		l.rr.swap(l.r)
+	}
 	return
 }
 
@@ -483,6 +685,7 @@ func (l *layer) SkipVerify() {
 		return
 	}
 	l.r = l.verifiableReader.SkipVerify()
+	l.rr.swap(l.r)
 }
 
 func (l *layer) Prefetch(prefetchSize int64) (err error) {
@@ -495,7 +698,7 @@ func (l *layer) Prefetch(prefetchSize int64) (err error) {
 			log.G(ctx).WithError(err).Warnf("failed to prefetch layer=%v", l.desc.Digest)
 			return
 		}
-		log.G(ctx).Debug("completed to prefetch")
+		log.G(ctx).Debug("completed to prefetch for layer: %s", l.desc.Digest)
 	})
 	return
 }
@@ -513,10 +716,12 @@ func (l *layer) prefetch(ctx context.Context, prefetchSize int64) error {
 	}
 	rootID := l.verifiableReader.Metadata().RootID()
 	if _, _, err := l.verifiableReader.Metadata().GetChild(rootID, estargz.NoPrefetchLandmark); err == nil {
+		log.G(ctx).Logf(log.DebugLevel, "contains no prefetch landmark, layer: %s", l.desc.Digest)
 		// do not prefetch this layer
 		return nil
 	} else if id, _, err := l.verifiableReader.Metadata().GetChild(rootID, estargz.PrefetchLandmark); err == nil {
 		offset, err := l.verifiableReader.Metadata().GetOffset(id)
+		log.G(ctx).Logf(log.DebugLevel, "contains prefetch landmark, layer: %s, offset: %d", l.desc.Digest, offset)
 		if err != nil {
 			return fmt.Errorf("failed to get offset of prefetch landmark: %w", err)
 		}
@@ -526,6 +731,7 @@ func (l *layer) prefetch(ctx context.Context, prefetchSize int64) error {
 		// adjust prefetch size not to exceed the whole layer size
 		prefetchSize = l.blob.Size()
 	}
+	log.G(ctx).Logf(log.DebugLevel, "actual prefetch size: %d\n for layer %s", prefetchSize, l.desc.Digest)
 
 	threshold := l.resolver.config.PrefetchAsyncSize
 	if threshold > 0 && prefetchSize > threshold {
@@ -540,7 +746,7 @@ func (l *layer) prefetch(ctx context.Context, prefetchSize int64) error {
 	// Fetch the target range
 	downloadStart := time.Now()
 	err := l.blob.Cache(0, prefetchSize)
-	commonmetrics.WriteLatencyLogValue(ctx, l.desc.Digest, commonmetrics.PrefetchDownload, downloadStart) // time to download prefetch data
+	commonmetrics.WriteLatencyLogValue(ctx, l.desc.Digest, commonmetrics.PrefetchDownload, downloadStart) // log donwload duration
 
 	if err != nil {
 		return fmt.Errorf("failed to prefetch layer: %w", err)
@@ -589,10 +795,22 @@ func (l *layer) backgroundFetch(ctx context.Context) error {
 	if l.isClosed() {
 		return fmt.Errorf("layer is already closed")
 	}
-	br := io.NewSectionReader(readerAtFunc(func(p []byte, offset int64) (retN int, retErr error) {
+	br := l.newBackgroundSectionReader()
+	defer commonmetrics.WriteLatencyLogValue(ctx, l.desc.Digest, commonmetrics.BackgroundFetchDecompress, time.Now()) // time to decompress background fetch data (in milliseconds)
+	return l.verifiableReader.Cache(
+		reader.WithReader(br),                // Read contents in background
+		reader.WithCacheOpts(cache.Direct()), // Do not pollute mem cache
+	)
+}
+
+// newBackgroundSectionReader builds a SectionReader over the layer's blob whose
+// reads are routed through the background task manager.
+func (l *layer) newBackgroundSectionReader() *io.SectionReader {
+	return io.NewSectionReader(readerAtFunc(func(p []byte, offset int64) (retN int, retErr error) {
 		l.resolver.backgroundTaskManager.InvokeBackgroundTask(func(ctx context.Context) {
 			// Measuring the time to download background fetch data (in milliseconds)
-			defer commonmetrics.MeasureLatencyInMilliseconds(commonmetrics.BackgroundFetchDownload, l.Info().Digest, time.Now()) // time to download background fetch data
+			defer commonmetrics.MeasureLatencyInMilliseconds(commonmetrics.BackgroundFetchDownload, l.Info().Digest, time.Now())
+			defer commonmetrics.WriteLatencyLogValue(ctx, l.Info().Digest, commonmetrics.BackgroundFetchDownload, time.Now())
 			retN, retErr = l.blob.ReadAt(
 				p,
 				offset,
@@ -602,10 +820,33 @@ func (l *layer) backgroundFetch(ctx context.Context) error {
 		}, 120*time.Second)
 		return
 	}), 0, l.blob.Size())
-	defer commonmetrics.WriteLatencyLogValue(ctx, l.desc.Digest, commonmetrics.BackgroundFetchDecompress, time.Now()) // time to decompress background fetch data (in milliseconds)
+}
+
+func (l *layer) BackgroundFetchChunks(ctx context.Context, chunks []ChunkRef) error {
+	if l.isClosed() {
+		return fmt.Errorf("layer is already closed")
+	}
+	if len(chunks) == 0 {
+		return nil
+	}
+	type chunkKey struct {
+		id  uint32
+		off int64
+	}
+	wantedChunks := make(map[chunkKey]struct{}, len(chunks))
+	for _, c := range chunks {
+		wantedChunks[chunkKey{id: c.FileID, off: c.Offset}] = struct{}{}
+	}
+	defer commonmetrics.WriteLatencyLogValue(ctx, l.desc.Digest, commonmetrics.BackgroundFetchTotal, time.Now())
+	br := l.newBackgroundSectionReader()
+	defer commonmetrics.WriteLatencyLogValue(ctx, l.desc.Digest, commonmetrics.BackgroundFetchDecompress, time.Now())
 	return l.verifiableReader.Cache(
-		reader.WithReader(br),                // Read contents in background
-		reader.WithCacheOpts(cache.Direct()), // Do not pollute mem cache
+		reader.WithReader(br),
+		reader.WithCacheOpts(cache.Direct()),
+		reader.WithChunkFilter(func(id uint32, chunkOffset int64) bool {
+			_, ok := wantedChunks[chunkKey{id: id, off: chunkOffset}]
+			return ok
+		}),
 	)
 }
 
@@ -625,7 +866,12 @@ func (l *layer) RootNode(baseInode uint32) (fusefs.InodeEmbedder, error) {
 	if l.r == nil {
 		return nil, fmt.Errorf("layer hasn't been verified yet")
 	}
-	return newNode(l.desc.Digest, l.r, l.blob, baseInode, l.resolver.overlayOpaqueType, l.passThrough, l.logFileAccess)
+	n, err := newNode(l.desc.Digest, l.rr, l.blob, baseInode, l.resolver.overlayOpaqueType, l.passThrough, l.logFileAccess)
+	if err != nil {
+		return nil, err
+	}
+	l.rootInode = n.EmbeddedInode()
+	return n, nil
 }
 
 func (l *layer) ReadAt(p []byte, offset int64, opts ...remote.Option) (int, error) {

@@ -79,7 +79,8 @@ var opaqueXattrs = map[OverlayOpaqueType][]string{
 	OverlayOpaqueUser:    {"user.overlay.opaque"},
 }
 
-func newNode(layerDgst digest.Digest, r reader.Reader, blob remote.Blob, baseInode uint32, opaque OverlayOpaqueType, pth passThroughConfig, logFileAccess bool) (fusefs.InodeEmbedder, error) {
+func newNode(layerDgst digest.Digest, rr *readerRef, blob remote.Blob, baseInode uint32, opaque OverlayOpaqueType, pth passThroughConfig, logFileAccess bool) (fusefs.InodeEmbedder, error) {
+	r := rr.get()
 	rootID := r.Metadata().RootID()
 	rootAttr, err := r.Metadata().GetAttr(rootID)
 	if err != nil {
@@ -90,7 +91,7 @@ func newNode(layerDgst digest.Digest, r reader.Reader, blob remote.Blob, baseIno
 		return nil, fmt.Errorf("unknown overlay opaque type")
 	}
 	ffs := &fs{
-		r:             r,
+		rr:            rr,
 		layerDigest:   layerDgst,
 		baseInode:     baseInode,
 		rootID:        rootID,
@@ -99,16 +100,17 @@ func newNode(layerDgst digest.Digest, r reader.Reader, blob remote.Blob, baseIno
 		logFileAccess: logFileAccess,
 	}
 	ffs.s = ffs.newState(layerDgst, blob)
-	return &node{
-		id:   rootID,
-		attr: rootAttr,
-		fs:   ffs,
-	}, nil
+	n := &node{
+		id: rootID,
+		fs: ffs,
+	}
+	n.attr.Store(&rootAttr)
+	return n, nil
 }
 
 // fs contains global metadata used by nodes
 type fs struct {
-	r             reader.Reader
+	rr            *readerRef
 	s             *state
 	layerDigest   digest.Digest
 	baseInode     uint32
@@ -130,10 +132,11 @@ func (n *node) logAccessOnce(ctx context.Context) {
 		return
 	}
 
+	a := n.loadAttr()
 	log.G(ctx).WithFields(log.Fields{
 		"layer": n.fs.layerDigest.String(),
-		"size":  n.attr.Size,
-		"mode":  fmt.Sprintf("%#o", n.attr.Mode.Perm()),
+		"size":  a.Size,
+		"mode":  fmt.Sprintf("%#o", a.Mode.Perm()),
 	}).Debugf("file accessed: %s", path.Join("/", n.Path(nil)))
 }
 
@@ -155,11 +158,15 @@ type node struct {
 	fs       *fs
 	id       uint32
 	accessed uint32
-	attr     metadata.Attr
+	attr     atomic.Pointer[metadata.Attr]
 
 	ents       []fuse.DirEntry
 	entsCached bool
 	entsMu     sync.Mutex
+}
+
+func (n *node) loadAttr() metadata.Attr {
+	return *n.attr.Load()
 }
 
 func (n *node) isRootNode() bool {
@@ -167,7 +174,7 @@ func (n *node) isRootNode() bool {
 }
 
 func (n *node) isOpaque() bool {
-	if _, _, err := n.fs.r.Metadata().GetChild(n.id, whiteoutOpaqueDir); err == nil {
+	if _, _, err := n.fs.rr.get().Metadata().GetChild(n.id, whiteoutOpaqueDir); err == nil {
 		return true
 	}
 	return false
@@ -204,7 +211,7 @@ func (n *node) readdir() ([]fuse.DirEntry, syscall.Errno) {
 	whiteouts := map[string]uint32{}
 	normalEnts := map[string]bool{}
 	var lastErr error
-	if err := n.fs.r.Metadata().ForeachChild(n.id, func(name string, id uint32, mode os.FileMode) bool {
+	if err := n.fs.rr.get().Metadata().ForeachChild(n.id, func(name string, id uint32, mode os.FileMode) bool {
 
 		// "." and ".." will be added later.
 		if name == "." || name == ".." {
@@ -307,7 +314,7 @@ func (n *node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fu
 				n.fs.s.report(fmt.Errorf("node.Lookup: %v", err))
 				return nil, syscall.EIO
 			}
-			entryToAttr(ino, tn.attr, &out.Attr)
+			entryToAttr(ino, tn.loadAttr(), &out.Attr)
 		case *whiteout:
 			ino, err := n.fs.inodeOfID(tn.id)
 			if err != nil {
@@ -338,10 +345,10 @@ func (n *node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fu
 	}
 	n.entsMu.Unlock()
 
-	id, ce, err := n.fs.r.Metadata().GetChild(n.id, name)
+	id, ce, err := n.fs.rr.get().Metadata().GetChild(n.id, name)
 	if err != nil {
 		// If the entry exists as a whiteout, show an overlayfs-styled whiteout node.
-		if whID, wh, err := n.fs.r.Metadata().GetChild(n.id, fmt.Sprintf("%s%s", whiteoutPrefix, name)); err == nil {
+		if whID, wh, err := n.fs.rr.get().Metadata().GetChild(n.id, fmt.Sprintf("%s%s", whiteoutPrefix, name)); err == nil {
 			ino, err := n.fs.inodeOfID(whID)
 			if err != nil {
 				n.fs.s.report(fmt.Errorf("node.Lookup: %v", err))
@@ -362,17 +369,18 @@ func (n *node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fu
 		n.fs.s.report(fmt.Errorf("node.Lookup: %v", err))
 		return nil, syscall.EIO
 	}
-	return n.NewInode(ctx, &node{
-		id:   id,
-		fs:   n.fs,
-		attr: ce,
-	}, entryToAttr(ino, ce, &out.Attr)), 0
+	child := &node{
+		id: id,
+		fs: n.fs,
+	}
+	child.attr.Store(&ce)
+	return n.NewInode(ctx, child, entryToAttr(ino, ce, &out.Attr)), 0
 }
 
 var _ = (fusefs.NodeOpener)((*node)(nil))
 
 func (n *node) Open(ctx context.Context, flags uint32) (fh fusefs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
-	ra, err := n.fs.r.OpenFile(n.id)
+	ra, err := n.fs.rr.get().OpenFile(n.id)
 	if err != nil {
 		n.fs.s.report(fmt.Errorf("node.Open: %v", err))
 		return nil, 0, syscall.EIO
@@ -388,7 +396,7 @@ func (n *node) Open(ctx context.Context, flags uint32) (fh fusefs.FileHandle, fu
 
 	if n.fs.passThrough.enable {
 		if getter, ok := ra.(reader.PassthroughFdGetter); ok {
-			fd, cr, err := getter.GetPassthroughFd(n.fs.passThrough.mergeBufferSize, n.fs.passThrough.mergeWorkerCount)
+			fd, cr, err := getter.GetPassthroughFd(ctx, n.fs.passThrough.mergeBufferSize, n.fs.passThrough.mergeWorkerCount)
 			if err != nil {
 				n.fs.s.report(fmt.Errorf("passThrough model failed due to node.Open: %v", err))
 				n.fs.passThrough.enable = false
@@ -410,14 +418,14 @@ func (n *node) Getattr(ctx context.Context, f fusefs.FileHandle, out *fuse.AttrO
 		n.fs.s.report(fmt.Errorf("node.Getattr: %v", err))
 		return syscall.EIO
 	}
-	entryToAttr(ino, n.attr, &out.Attr)
+	entryToAttr(ino, n.loadAttr(), &out.Attr)
 	return 0
 }
 
 var _ = (fusefs.NodeGetxattrer)((*node)(nil))
 
 func (n *node) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, syscall.Errno) {
-	ent := n.attr
+	ent := n.loadAttr()
 	opq := n.isOpaque()
 	for _, opaqueXattr := range n.fs.opaqueXattrs {
 		if attr == opaqueXattr && opq {
@@ -440,7 +448,7 @@ func (n *node) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, 
 var _ = (fusefs.NodeListxattrer)((*node)(nil))
 
 func (n *node) Listxattr(ctx context.Context, dest []byte) (uint32, syscall.Errno) {
-	ent := n.attr
+	ent := n.loadAttr()
 	opq := n.isOpaque()
 	var attrs []byte
 	if opq {
@@ -462,7 +470,7 @@ var _ = (fusefs.NodeReadlinker)((*node)(nil))
 
 func (n *node) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
 	n.logAccessOnce(ctx)
-	ent := n.attr
+	ent := n.loadAttr()
 	return []byte(ent.LinkName), 0
 }
 
@@ -502,7 +510,7 @@ func (f *file) Getattr(ctx context.Context, out *fuse.AttrOut) syscall.Errno {
 		f.n.fs.s.report(fmt.Errorf("file.Getattr: %v", err))
 		return syscall.EIO
 	}
-	entryToAttr(ino, f.n.attr, &out.Attr)
+	entryToAttr(ino, f.n.loadAttr(), &out.Attr)
 	return 0
 }
 
