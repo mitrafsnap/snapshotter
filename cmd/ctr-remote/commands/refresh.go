@@ -190,8 +190,39 @@ var RefreshCommand = &cli.Command{
 		if failed > 0 {
 			return fmt.Errorf("%d layer(s) failed to refresh", failed)
 		}
+		// The mount now serves newRef. Record that in the image store, so a
+		// later refresh of the same ref diffs against what is mounted.
+		if err := recordImage(ctx, client, resolver, newRef, platformMatcher); err != nil {
+			return fmt.Errorf("refreshed, but recording %q failed: %w", newRef, err)
+		}
 		return nil
 	},
+}
+
+// recordImage points the local image record for ref at its registry version,
+// fetching only the index, manifest and config. Layers stay remote: the
+// snapshotter already serves them.
+func recordImage(ctx context.Context, client *containerd.Client, resolver remotes.Resolver, ref string, platform platforms.MatchComparer) error {
+	skipLayers := func(h images.Handler) images.Handler {
+		return images.HandlerFunc(func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+			children, err := h.Handle(ctx, desc)
+			if err != nil {
+				return nil, err
+			}
+			kept := children[:0]
+			for _, c := range children {
+				if !images.IsLayerType(c.MediaType) {
+					kept = append(kept, c)
+				}
+			}
+			return kept, nil
+		})
+	}
+	_, err := client.Fetch(ctx, ref,
+		containerd.WithResolver(resolver),
+		containerd.WithPlatformMatcher(platform),
+		containerd.WithImageHandlerWrapper(skipLayers))
+	return err
 }
 
 // manifestFromLocal looks up an image in the local containerd image store and
