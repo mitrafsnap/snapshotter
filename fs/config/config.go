@@ -168,4 +168,11 @@ type FuseConfig struct {
 
 	// MergeWorkerCount is the number of workers to merge chunks for passthrough mode. Default is 10.
 	MergeWorkerCount int `toml:"merge_worker_count" default:"10" json:"merge_worker_count"`
+
+	// DisableXattrs answers every getxattr with ENOSYS, so the kernel treats the
+	// mount as having no xattrs. Some kernels (Docker Desktop's LinuxKit) fail
+	// every exec through overlayfs on a FUSE layer that supports xattrs. Opaque
+	// directories are then not visible to overlayfs, so enable this only where
+	// needed. Default is false.
+	DisableXattrs bool `toml:"disable_xattrs" json:"disable_xattrs"`
 }

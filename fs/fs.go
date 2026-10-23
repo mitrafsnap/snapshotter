@@ -188,6 +188,7 @@ func NewFilesystem(root string, cfg config.Config, opts ...Option) (_ snapshot.F
 		noprefetch:            cfg.NoPrefetch,
 		noBackgroundFetch:     cfg.NoBackgroundFetch,
 		debug:                 cfg.Debug,
+		disableXattrs:         cfg.DisableXattrs,
 		layer:                 make(map[string]layer.Layer),
 		backgroundTaskManager: tm,
 		allowNoVerification:   cfg.AllowNoVerification,
@@ -205,6 +206,7 @@ type filesystem struct {
 	noprefetch            bool
 	noBackgroundFetch     bool
 	debug                 bool
+	disableXattrs         bool
 	layer                 map[string]layer.Layer
 	layerMu               sync.Mutex
 	backgroundTaskManager *task.BackgroundTaskManager
@@ -366,8 +368,9 @@ func (fs *filesystem) Mount(ctx context.Context, mountpoint string, labels map[s
 	mountOpts := &fuse.MountOptions{
 		AllowOther:  true,     // allow users other than root&mounter to access fs
 		FsName:      "stargz", // name this filesystem as "stargz"
-		Debug:       fs.debug,
-		DirectMount: true,
+		Debug:         fs.debug,
+		DirectMount:   true,
+		DisableXAttrs: fs.disableXattrs,
 	}
 	server, err := fuse.NewServer(rawFS, mountpoint, mountOpts)
 	if err != nil {
