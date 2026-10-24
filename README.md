@@ -1,3 +1,49 @@
+# MitraFSnap snapshotter
+
+This is the MitraFSnap snapshotter, a fork of the containerd
+[stargz snapshotter](https://github.com/containerd/stargz-snapshotter). It keeps lazy
+pulling of eStargz and zstd:chunked layers, and it adds a **refresh** operation that
+updates the layers of a running container to a new image version without replacing the
+container.
+
+A refresh pairs each mounted layer with its counterpart in the new version and compares
+their chunk indexes (TOCs). It then swaps the readers of the changed layers and
+invalidates only the cached ranges whose chunks changed. Unchanged layers and chunks stay
+in the cache, and the container keeps its mount. The application decides when to reopen
+the files that changed.
+
+## Additions to upstream
+
+`ctr-remote` has five new commands.
+
+```
+ctr-remote refresh <ref>                 refresh containers of <ref> to the version the tag points to now
+ctr-remote refresh <old-ref> <new-ref>   refresh from one image to another
+ctr-remote watch <ref> [--interval 30s]  poll the tag and refresh whenever it changes
+ctr-remote unwatch <ref>                 stop watching a tag
+ctr-remote watch-list                    list active watches
+ctr-remote fetch-toc <repo>@<digest>     print the TOC of a layer (for debugging)
+```
+
+`refresh` and `watch` accept `--with-background-fetch`, which fetches the changed chunks of
+every refreshed layer in the background after the swap. A refresh also records the new
+version in containerd's image store, so a later refresh starts from it.
+
+The daemon takes the prefetch annotations that the MitraFSnap
+[registry](https://github.com/mitrafsnap/registry) adds to the manifest, so a client pulls
+the selected partitions eagerly and everything else on demand. The new `[fuse]` option
+`disable_xattrs = true` makes the FUSE mount answer `getxattr` with ENOSYS. Kernels such
+as the one in Docker Desktop otherwise fail to exec binaries from an overlay on top of the
+FUSE mount.
+
+The [demo](https://github.com/mitrafsnap/demo) builds this repository and uses refresh for
+in-place updates, and the [evaluation](https://github.com/mitrafsnap/evaluation) measures
+it against Docker, eStargz and 2DFS.
+
+The upstream README follows.
+
+---
+
 [[⬇️ **Download**]](https://github.com/containerd/stargz-snapshotter/releases)
 [[📔**Browse images**]](./docs/pre-converted-images.md)
 [[☸**Quick Start (Kubernetes)**]](#quick-start-with-kubernetes)
